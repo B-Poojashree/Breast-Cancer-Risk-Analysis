@@ -4,11 +4,14 @@ from pathlib import Path
 import joblib
 import mlflow
 import mlflow.sklearn
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 MODEL_NAME = "HealthPredictBreastCancerClassifier"
@@ -28,6 +31,34 @@ def get_tracking_uri() -> str:
     return Path("mlruns").absolute().as_uri()
 
 
+def build_fallback_model() -> Pipeline:
+    data = load_breast_cancer(as_frame=True)
+    X = data.data[FEATURES]
+    y = data.target
+
+    model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                CalibratedClassifierCV(
+                    estimator=RandomForestClassifier(
+                        n_estimators=200,
+                        max_depth=10,
+                        min_samples_split=2,
+                        random_state=42,
+                        n_jobs=-1,
+                    ),
+                    method="sigmoid",
+                    cv=3,
+                ),
+            ),
+        ]
+    )
+    model.fit(X, y)
+    return model
+
+
 @st.cache_resource
 def load_model():
     mlflow.set_tracking_uri(get_tracking_uri())
@@ -36,29 +67,34 @@ def load_model():
     try:
         return mlflow.sklearn.load_model(model_uri)
     except Exception:
-        # Fallback to latest local run if registry is unavailable.
+        pass
+
+    # Prefer a bundled artifact if available in the runtime image.
+    local_model = Path("artifacts") / "best_model.joblib"
+    if local_model.exists():
+        return joblib.load(local_model)
+
+    # Fallback to latest local run if registry is unavailable.
+    try:
         client = mlflow.tracking.MlflowClient()
         experiment = client.get_experiment_by_name("healthpredict_breast_cancer")
-        if experiment is None:
-            raise RuntimeError("No experiment found. Run train.py first.")
+        if experiment is not None:
+            runs = client.search_runs(
+                experiment_ids=[experiment.experiment_id],
+                order_by=["metrics.roc_auc DESC"],
+                max_results=1,
+            )
+            if runs:
+                run_id = runs[0].info.run_id
+                try:
+                    return mlflow.sklearn.load_model(f"runs:/{run_id}/model")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-        runs = client.search_runs(
-            experiment_ids=[experiment.experiment_id],
-            order_by=["metrics.roc_auc DESC"],
-            max_results=1,
-        )
-        if runs:
-            run_id = runs[0].info.run_id
-            try:
-                return mlflow.sklearn.load_model(f"runs:/{run_id}/model")
-            except Exception:
-                pass
-
-        local_model = Path("artifacts") / "best_model.joblib"
-        if local_model.exists():
-            return joblib.load(local_model)
-
-        raise RuntimeError("No trained model found. Run train.py first.")
+    # Last-resort fallback keeps the app usable on first deploys.
+    return build_fallback_model()
 
 
 @st.cache_data
